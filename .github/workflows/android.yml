@@ -1,0 +1,141 @@
+name: Build Gridscape Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      api_base_url:
+        description: 'Public HTTPS URL of the Gridscape API server (optional for UI-only builds)'
+        required: false
+        type: string
+      build_type:
+        description: 'APK build type'
+        required: true
+        default: debug
+        type: choice
+        options:
+          - debug
+          - release
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '22'
+  JAVA_VERSION: '21'
+  ANDROID_API_LEVEL: '35'
+  ANDROID_BUILD_TOOLS: '35.0.0'
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Resolve API URL
+        env:
+          INPUT_API_URL: ${{ github.event.inputs.api_base_url }}
+          REPO_API_URL: ${{ vars.VITE_API_BASE_URL }}
+        run: |
+          API_URL="$INPUT_API_URL"
+          if [ -z "$API_URL" ]; then API_URL="$REPO_API_URL"; fi
+          if [ -n "$API_URL" ]; then
+            echo "VITE_API_BASE_URL=$API_URL" >> "$GITHUB_ENV"
+            echo "Using configured API endpoint."
+          else
+            echo "VITE_API_BASE_URL=" >> "$GITHUB_ENV"
+            echo "No API URL configured; building the UI with relative API paths."
+          fi
+
+      - name: Type-check
+        run: npm run lint
+
+      - name: Build web app
+        run: npm run build:web
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          sdkmanager "platform-tools" "platforms;android-${ANDROID_API_LEVEL}" "build-tools;${ANDROID_BUILD_TOOLS}"
+          yes | sdkmanager --licenses >/dev/null || true
+
+      - name: Create Android project
+        run: npx cap add android
+
+      - name: Sync Capacitor
+        run: npx cap sync android
+
+      - name: Build debug APK
+        if: ${{ github.event_name == 'push' || github.event.inputs.build_type != 'release' }}
+        working-directory: android
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Upload debug APK
+        if: ${{ github.event_name == 'push' || github.event.inputs.build_type != 'release' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gridscape-debug-${{ github.sha }}
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Build release APK
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.build_type == 'release' }}
+        working-directory: android
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Generate temporary release signing key
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.build_type == 'release' }}
+        run: |
+          keytool -genkeypair \
+            -keystore "$RUNNER_TEMP/gridscape-release.jks" \
+            -storepass changeit \
+            -keypass changeit \
+            -alias gridscape \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Gridscape, OU=Mobile, O=Gridscape, L=Unknown, S=Unknown, C=PK"
+
+      - name: Sign release APK
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.build_type == 'release' }}
+        run: |
+          UNSIGNED="android/app/build/outputs/apk/release/app-release-unsigned.apk"
+          SIGNED="android/app/build/outputs/apk/release/gridscape-release.apk"
+          "$ANDROID_HOME/build-tools/${ANDROID_BUILD_TOOLS}/apksigner" sign \
+            --ks "$RUNNER_TEMP/gridscape-release.jks" \
+            --ks-pass pass:changeit \
+            --key-pass pass:changeit \
+            --out "$SIGNED" \
+            "$UNSIGNED"
+          "$ANDROID_HOME/build-tools/${ANDROID_BUILD_TOOLS}/apksigner" verify "$SIGNED"
+
+      - name: Upload release APK
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.build_type == 'release' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gridscape-release-${{ github.sha }}
+          path: android/app/build/outputs/apk/release/gridscape-release.apk
+          if-no-files-found: error
+          retention-days: 14
